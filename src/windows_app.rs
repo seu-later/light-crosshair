@@ -49,6 +49,7 @@ use crate::{
 const SETTINGS_CLASS: &str = "LightCrosshair.Settings";
 const OVERLAY_CLASS: &str = "LightCrosshair.Overlay";
 const MUTEX_NAME: &str = "Local\\LightCrosshair.SingleInstance";
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_SETTINGS: u32 = WM_APP + 2;
@@ -135,6 +136,7 @@ impl Default for Controls {
 
 struct App {
     instance: HINSTANCE,
+    icon: HICON,
     settings: HWND,
     overlay: HWND,
     controls: Controls,
@@ -149,9 +151,10 @@ struct App {
 }
 
 impl App {
-    fn new(instance: HINSTANCE) -> Self {
+    fn new(instance: HINSTANCE, icon: HICON) -> Self {
         Self {
             instance,
+            icon,
             settings: null_mut(),
             overlay: null_mut(),
             controls: Controls::default(),
@@ -617,7 +620,7 @@ impl App {
             uID: 1,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: unsafe { LoadIconW(null_mut(), IDI_APPLICATION) },
+            hIcon: self.icon,
             ..NOTIFYICONDATAW::default()
         };
         copy_wide(&mut self.tray.szTip, "LightCrosshair");
@@ -704,14 +707,15 @@ pub fn run() {
         }
 
         let instance = GetModuleHandleW(null());
-        register_window_classes(instance);
+        let icon = create_app_icon();
+        register_window_classes(instance, icon);
         let controls = INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_BAR_CLASSES,
         };
         InitCommonControlsEx(&controls);
 
-        let mut app = Box::new(App::new(instance));
+        let mut app = Box::new(App::new(instance, icon));
         let app_pointer = (&mut *app as *mut App).cast::<c_void>();
         let settings_class = wide(SETTINGS_CLASS);
         let title = wide("LightCrosshair Settings");
@@ -782,13 +786,33 @@ pub fn run() {
     }
 }
 
-unsafe fn register_window_classes(instance: HINSTANCE) {
+unsafe fn create_app_icon() -> HICON {
+    let icon = unsafe {
+        CreateIconFromResourceEx(
+            APP_ICON_PNG.as_ptr(),
+            APP_ICON_PNG.len() as u32,
+            1,
+            0x00030000,
+            GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON),
+            LR_DEFAULTCOLOR,
+        )
+    };
+    if icon.is_null() {
+        unsafe { LoadIconW(null_mut(), IDI_APPLICATION) }
+    } else {
+        icon
+    }
+}
+
+unsafe fn register_window_classes(instance: HINSTANCE, icon: HICON) {
     let cursor = unsafe { LoadCursorW(null_mut(), IDC_ARROW) };
     let settings_name = wide(SETTINGS_CLASS);
     let settings_class = WNDCLASSW {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(settings_proc),
         hInstance: instance,
+        hIcon: icon,
         hCursor: cursor,
         hbrBackground: (COLOR_WINDOW + 1) as _,
         lpszClassName: settings_name.as_ptr(),
