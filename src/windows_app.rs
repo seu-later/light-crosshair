@@ -3,6 +3,7 @@ use std::{
     mem::{size_of, zeroed},
     path::PathBuf,
     ptr::{copy_nonoverlapping, null, null_mut},
+    sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
 };
 
 use windows_sys::Win32::{
@@ -14,7 +15,7 @@ use windows_sys::Win32::{
         AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
         COLOR_WINDOW, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,
         EnumDisplayMonitors, GetMonitorInfoW, GetStockObject, HDC, HFONT, HGDIOBJ, HMONITOR,
-        MONITORINFO, MONITORINFOEXW, SelectObject,
+        InvalidateRect, MONITORINFO, MONITORINFOEXW, SelectObject,
     },
     System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
     UI::{
@@ -28,8 +29,9 @@ use windows_sys::Win32::{
         },
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::{
-            GetKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
-            SetFocus, UnregisterHotKey, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+            GetAsyncKeyState, GetFocus, GetKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
+            MOD_WIN, RegisterHotKey, SetFocus, UnregisterHotKey, VK_CONTROL, VK_ESCAPE, VK_LWIN,
+            VK_MENU, VK_RWIN, VK_SHIFT,
         },
         Shell::{
             DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
@@ -41,8 +43,11 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    config::{Config, MAX_SCALE_PERCENT, MIN_SCALE_PERCENT, parse_hex},
-    hotkeys::Hotkey,
+    config::{
+        Config, HideMode, MAX_OFFSET_PX, MAX_OPACITY_PERCENT, MAX_SCALE_PERCENT, MIN_OFFSET_PX,
+        MIN_OPACITY_PERCENT, MIN_SCALE_PERCENT, parse_hex,
+    },
+    hotkeys::{Hotkey, VK_MOUSE_LEFT, VK_MOUSE_MIDDLE, VK_MOUSE_RIGHT, VK_MOUSE_X1, VK_MOUSE_X2},
     image_processing::{OriginalImage, ProcessedImage},
 };
 
@@ -54,6 +59,8 @@ const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_SETTINGS: u32 = WM_APP + 2;
 const WM_CAPTURED_HOTKEY: u32 = WM_APP + 3;
+const WM_HIDE_TRIGGER_DOWN: u32 = WM_APP + 4;
+const WM_HIDE_TRIGGER_UP: u32 = WM_APP + 5;
 
 const ID_LOAD: i32 = 1001;
 const ID_TINT_ENABLED: i32 = 1002;
@@ -63,10 +70,21 @@ const ID_SCALE: i32 = 1005;
 const ID_SCALE_VALUE: i32 = 1006;
 const ID_MONITOR: i32 = 1007;
 const ID_SCALE_INPUT: i32 = 1008;
+const ID_OPACITY: i32 = 1009;
+const ID_OPACITY_INPUT: i32 = 1010;
+const ID_OPACITY_VALUE: i32 = 1011;
+const ID_OFFSET_X: i32 = 1012;
+const ID_OFFSET_X_INPUT: i32 = 1013;
+const ID_OFFSET_X_VALUE: i32 = 1014;
+const ID_OFFSET_Y: i32 = 1015;
+const ID_OFFSET_Y_INPUT: i32 = 1016;
+const ID_OFFSET_Y_VALUE: i32 = 1017;
+const ID_HIDE_MODE: i32 = 1018;
+const ID_HIDE_HINT: i32 = 1019;
 const ID_HOTKEY_CENTER: i32 = 1101;
 const ID_HOTKEY_HIDE: i32 = 1102;
 const ID_HOTKEY_SHOW: i32 = 1103;
-const ID_HOTKEY_TOGGLE: i32 = 1104;
+const ID_HOTKEY_BIND: i32 = 1104;
 const ID_CENTER_NOW: i32 = 1201;
 const ID_HIDE_NOW: i32 = 1202;
 
@@ -80,7 +98,6 @@ const MENU_EXIT: usize = 2006;
 const HOTKEY_CENTER: i32 = 1;
 const HOTKEY_HIDE: i32 = 2;
 const HOTKEY_SHOW: i32 = 3;
-const HOTKEY_TOGGLE: i32 = 4;
 
 const EN_CHANGE: u16 = 0x0300;
 const EN_KILLFOCUS: u16 = 0x0200;
@@ -91,6 +108,17 @@ const CB_GETCURSEL: u32 = 0x0147;
 const CB_RESETCONTENT: u32 = 0x014B;
 const CB_SETCURSEL: u32 = 0x014E;
 const TBM_GETPOS: u32 = WM_USER;
+
+/// Low-order word of `wparam` for `WM_XBUTTONDOWN`: the first side mouse button.
+const XBUTTON1_ID: usize = 1;
+
+static HIDE_HOOK_WINDOW: AtomicIsize = AtomicIsize::new(0);
+static HIDE_HOOK_KEY: AtomicU32 = AtomicU32::new(0);
+static HIDE_HOOK_MODIFIERS: AtomicU32 = AtomicU32::new(0);
+static HIDE_HOOK_PRESSED: AtomicBool = AtomicBool::new(false);
+static HIDE_HOOK_SHOW_KEY: AtomicU32 = AtomicU32::new(0);
+static HIDE_HOOK_SHOW_MODIFIERS: AtomicU32 = AtomicU32::new(0);
+static HIDE_HOOK_SHOW_PRESSED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct Monitor {
@@ -109,11 +137,25 @@ struct Controls {
     scale: HWND,
     scale_input: HWND,
     scale_value: HWND,
+    opacity: HWND,
+    opacity_input: HWND,
+    opacity_value: HWND,
+    offset_x: HWND,
+    offset_x_input: HWND,
+    offset_x_value: HWND,
+    offset_y: HWND,
+    offset_y_input: HWND,
+    offset_y_value: HWND,
     monitor: HWND,
+    hide_mode: HWND,
+    hide_hint: HWND,
     hotkey_center: HWND,
+    hotkey_hide_label: HWND,
     hotkey_hide: HWND,
+    hotkey_show_label: HWND,
     hotkey_show: HWND,
-    hotkey_toggle: HWND,
+    hotkey_bind_label: HWND,
+    hotkey_bind: HWND,
 }
 
 impl Default for Controls {
@@ -125,18 +167,32 @@ impl Default for Controls {
             scale: null_mut(),
             scale_input: null_mut(),
             scale_value: null_mut(),
+            opacity: null_mut(),
+            opacity_input: null_mut(),
+            opacity_value: null_mut(),
+            offset_x: null_mut(),
+            offset_x_input: null_mut(),
+            offset_x_value: null_mut(),
+            offset_y: null_mut(),
+            offset_y_input: null_mut(),
+            offset_y_value: null_mut(),
             monitor: null_mut(),
+            hide_mode: null_mut(),
+            hide_hint: null_mut(),
             hotkey_center: null_mut(),
+            hotkey_hide_label: null_mut(),
             hotkey_hide: null_mut(),
+            hotkey_show_label: null_mut(),
             hotkey_show: null_mut(),
-            hotkey_toggle: null_mut(),
+            hotkey_bind_label: null_mut(),
+            hotkey_bind: null_mut(),
         }
     }
 }
 
 struct App {
     instance: HINSTANCE,
-    icon: HICON,
+    small_icon: HICON,
     settings: HWND,
     overlay: HWND,
     controls: Controls,
@@ -145,16 +201,18 @@ struct App {
     original: Option<OriginalImage>,
     processed: Option<ProcessedImage>,
     tray: NOTIFYICONDATAW,
+    mouse_hook: HHOOK,
+    keyboard_hook: HHOOK,
     initializing: bool,
     exiting: bool,
     config_error_shown: bool,
 }
 
 impl App {
-    fn new(instance: HINSTANCE, icon: HICON) -> Self {
+    fn new(instance: HINSTANCE, small_icon: HICON) -> Self {
         Self {
             instance,
-            icon,
+            small_icon,
             settings: null_mut(),
             overlay: null_mut(),
             controls: Controls::default(),
@@ -163,6 +221,8 @@ impl App {
             original: None,
             processed: None,
             tray: NOTIFYICONDATAW::default(),
+            mouse_hook: null_mut(),
+            keyboard_hook: null_mut(),
             initializing: true,
             exiting: false,
             config_error_shown: false,
@@ -208,20 +268,45 @@ impl App {
                 0,
             );
             set_text(self.controls.tint_hex, &self.config.tint);
-            SendMessageW(
+            self.update_slider(
                 self.controls.scale,
-                TBM_SETRANGE,
-                1,
-                make_lparam(MIN_SCALE_PERCENT as u16, MAX_SCALE_PERCENT as u16),
+                MIN_SCALE_PERCENT as i32,
+                MAX_SCALE_PERCENT as i32,
+                self.config.scale as i32,
             );
-            SendMessageW(
-                self.controls.scale,
-                TBM_SETPOS,
-                1,
-                self.config.scale as isize,
+            self.update_slider(
+                self.controls.opacity,
+                MIN_OPACITY_PERCENT as i32,
+                MAX_OPACITY_PERCENT as i32,
+                self.config.opacity as i32,
+            );
+            self.update_slider(
+                self.controls.offset_x,
+                MIN_OFFSET_PX,
+                MAX_OFFSET_PX,
+                self.config.offset_x,
+            );
+            self.update_slider(
+                self.controls.offset_y,
+                MIN_OFFSET_PX,
+                MAX_OFFSET_PX,
+                self.config.offset_y,
             );
             self.update_scale_display(true);
+            self.update_opacity_display(true);
+            self.update_offset_displays(true);
+            let mode = self.config.hide_mode as usize;
+            SendMessageW(self.controls.hide_mode, CB_SETCURSEL, mode, 0);
+            self.update_hide_hint();
+            self.update_hide_section();
             self.update_hotkey_labels();
+        }
+    }
+
+    fn update_slider(&self, slider: HWND, min: i32, max: i32, value: i32) {
+        unsafe {
+            SendMessageW(slider, TBM_SETRANGE, 1, make_lparam(min as u16, max as u16));
+            SendMessageW(slider, TBM_SETPOS, 1, value as isize);
         }
     }
 
@@ -241,17 +326,76 @@ impl App {
         );
     }
 
+    fn update_opacity_display(&mut self, update_input: bool) {
+        if update_input {
+            let was_initializing = self.initializing;
+            self.initializing = true;
+            set_text(
+                self.controls.opacity_input,
+                &self.config.opacity.to_string(),
+            );
+            self.initializing = was_initializing;
+        }
+        set_text(
+            self.controls.opacity_value,
+            &format!("{}%", self.config.opacity),
+        );
+    }
+
+    fn update_offset_displays(&mut self, update_inputs: bool) {
+        if update_inputs {
+            let was_initializing = self.initializing;
+            self.initializing = true;
+            set_text(
+                self.controls.offset_x_input,
+                &self.config.offset_x.to_string(),
+            );
+            set_text(
+                self.controls.offset_y_input,
+                &self.config.offset_y.to_string(),
+            );
+            self.initializing = was_initializing;
+        }
+        set_text(self.controls.offset_x_value, "px");
+        set_text(self.controls.offset_y_value, "px");
+    }
+
+    fn update_hide_hint(&mut self) {
+        let hint = match self.config.hide_mode {
+            HideMode::Off => "Hide/show binds are disabled.",
+            HideMode::Toggle => {
+                "Press the Hide shortcut or mouse button to hide the crosshair; press the Show one to display it again."
+            }
+            HideMode::Hold => {
+                "Hold the shortcut or mouse button down to hide the crosshair; release it to show again."
+            }
+        };
+        set_text(self.controls.hide_hint, hint);
+        unsafe { InvalidateRect(self.controls.hide_hint, null(), 1) };
+    }
+
+    /// Shows the fields that matter for the selected mode: Hold uses the
+    /// single bind, Toggle uses the separate hide/show pair, Off hides all.
+    fn update_hide_section(&mut self) {
+        let (show_bind, show_pair) = hide_section_visibility(self.config.hide_mode);
+        unsafe {
+            ShowWindow(self.controls.hotkey_bind_label, show_bind as i32);
+            ShowWindow(self.controls.hotkey_bind, show_bind as i32);
+            ShowWindow(self.controls.hotkey_hide_label, show_pair as i32);
+            ShowWindow(self.controls.hotkey_hide, show_pair as i32);
+            ShowWindow(self.controls.hotkey_show_label, show_pair as i32);
+            ShowWindow(self.controls.hotkey_show, show_pair as i32);
+        }
+    }
+
     fn update_hotkey_labels(&self) {
         set_text(
             self.controls.hotkey_center,
             &self.config.center_hotkey.label(),
         );
         set_text(self.controls.hotkey_hide, &self.config.hide_hotkey.label());
+        set_text(self.controls.hotkey_bind, &self.config.hide_hotkey.label());
         set_text(self.controls.hotkey_show, &self.config.show_hotkey.label());
-        set_text(
-            self.controls.hotkey_toggle,
-            &self.config.toggle_hotkey.label(),
-        );
     }
 
     fn refresh_monitors(&mut self) {
@@ -389,7 +533,13 @@ impl App {
         let (Some(image), Some(monitor)) = (&self.processed, self.selected_monitor()) else {
             return;
         };
-        let (x, y) = centered_position(monitor, image.width as i32, image.height as i32);
+        let (x, y) = centered_position(
+            monitor,
+            image.width as i32,
+            image.height as i32,
+            self.config.offset_x,
+            self.config.offset_y,
+        );
 
         unsafe {
             let memory_dc = CreateCompatibleDC(null_mut());
@@ -434,7 +584,8 @@ impl App {
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
-                SourceConstantAlpha: 255,
+                SourceConstantAlpha: (self.config.opacity.min(MAX_OPACITY_PERCENT) * 255 / 100)
+                    as u8,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
             UpdateLayeredWindow(
@@ -472,7 +623,13 @@ impl App {
         let (Some(image), Some(monitor)) = (&self.processed, self.selected_monitor()) else {
             return;
         };
-        let (x, y) = centered_position(monitor, image.width as i32, image.height as i32);
+        let (x, y) = centered_position(
+            monitor,
+            image.width as i32,
+            image.height as i32,
+            self.config.offset_x,
+            self.config.offset_y,
+        );
         unsafe {
             SetWindowPos(
                 self.overlay,
@@ -489,6 +646,17 @@ impl App {
                     },
             );
         }
+    }
+
+    fn reset_offsets_and_center(&mut self) {
+        self.config.reset_offsets();
+        unsafe {
+            SendMessageW(self.controls.offset_x, TBM_SETPOS, 1, 0);
+            SendMessageW(self.controls.offset_y, TBM_SETPOS, 1, 0);
+        }
+        self.update_offset_displays(true);
+        self.center_overlay();
+        self.save_config();
     }
 
     fn set_visible(&mut self, visible: bool) {
@@ -562,52 +730,153 @@ impl App {
         }
     }
 
-    fn register_initial_hotkeys(&self) {
-        for (id, hotkey) in [
-            (HOTKEY_CENTER, self.config.center_hotkey),
-            (HOTKEY_HIDE, self.config.hide_hotkey),
-            (HOTKEY_SHOW, self.config.show_hotkey),
-            (HOTKEY_TOGGLE, self.config.toggle_hotkey),
-        ] {
-            if !register_hotkey(self.settings, id, hotkey) {
-                message(
-                    self.settings,
-                    &format!(
-                        "{} could not be registered. This shortcut is already being used by Windows or another application.",
-                        hotkey.label()
-                    ),
-                    "Hotkey conflict",
-                );
+    fn register_initial_hotkeys(&mut self) {
+        if !register_hotkey(self.settings, HOTKEY_CENTER, self.config.center_hotkey) {
+            message(
+                self.settings,
+                &format!(
+                    "{} could not be registered. This shortcut is already being used by Windows or another application.",
+                    self.config.center_hotkey.label()
+                ),
+                "Hotkey conflict",
+            );
+        }
+        self.apply_hide_bind();
+    }
+
+    /// Re-applies the hide/show triggers after a bind or mode changed:
+    /// keyboard binds use RegisterHotKey, mouse buttons use the low-level
+    /// mouse hook. Hold mode tracks one bind; Toggle tracks hide and show.
+    fn apply_hide_bind(&mut self) {
+        unsafe {
+            UnregisterHotKey(self.settings, HOTKEY_HIDE);
+            UnregisterHotKey(self.settings, HOTKEY_SHOW);
+        }
+        HIDE_HOOK_PRESSED.store(false, Ordering::Relaxed);
+        HIDE_HOOK_SHOW_PRESSED.store(false, Ordering::Relaxed);
+        self.remove_hooks();
+
+        let mode = self.config.hide_mode;
+        if mode == HideMode::Off {
+            return;
+        }
+        HIDE_HOOK_WINDOW.store(self.settings as isize, Ordering::Relaxed);
+
+        if mode == HideMode::Hold {
+            let bind = self.config.hide_hotkey;
+            HIDE_HOOK_KEY.store(bind.key, Ordering::Relaxed);
+            HIDE_HOOK_MODIFIERS.store(bind.modifiers, Ordering::Relaxed);
+            HIDE_HOOK_SHOW_KEY.store(0, Ordering::Relaxed);
+            if bind.is_mouse() {
+                unsafe {
+                    self.mouse_hook =
+                        SetWindowsHookExW(WH_MOUSE_LL, Some(hide_mouse_hook_proc), null_mut(), 0);
+                }
+            } else {
+                // Hold needs press and release events; RegisterHotKey only
+                // reports presses, so track the key with a low-level hook.
+                unsafe {
+                    self.keyboard_hook = SetWindowsHookExW(
+                        WH_KEYBOARD_LL,
+                        Some(hide_keyboard_hook_proc),
+                        null_mut(),
+                        0,
+                    );
+                }
+            }
+            return;
+        }
+
+        let hide_bind = self.config.hide_hotkey;
+        let show_bind = self.config.show_hotkey;
+        HIDE_HOOK_KEY.store(hide_bind.key, Ordering::Relaxed);
+        HIDE_HOOK_MODIFIERS.store(hide_bind.modifiers, Ordering::Relaxed);
+        HIDE_HOOK_SHOW_KEY.store(show_bind.key, Ordering::Relaxed);
+        HIDE_HOOK_SHOW_MODIFIERS.store(show_bind.modifiers, Ordering::Relaxed);
+        if hide_bind.is_mouse() || show_bind.is_mouse() {
+            unsafe {
+                self.mouse_hook =
+                    SetWindowsHookExW(WH_MOUSE_LL, Some(hide_mouse_hook_proc), null_mut(), 0);
+            }
+        }
+        if !hide_bind.is_mouse() && !register_hotkey(self.settings, HOTKEY_HIDE, hide_bind) {
+            message(
+                self.settings,
+                &format!(
+                    "{} could not be registered. This shortcut is already being used by Windows or another application.",
+                    hide_bind.label()
+                ),
+                "Hotkey conflict",
+            );
+        }
+        if !show_bind.is_mouse() && !register_hotkey(self.settings, HOTKEY_SHOW, show_bind) {
+            message(
+                self.settings,
+                &format!(
+                    "{} could not be registered. This shortcut is already being used by Windows or another application.",
+                    show_bind.label()
+                ),
+                "Hotkey conflict",
+            );
+        }
+    }
+
+    fn remove_hooks(&mut self) {
+        unsafe {
+            if !self.mouse_hook.is_null() {
+                UnhookWindowsHookEx(self.mouse_hook);
+                self.mouse_hook = null_mut();
+            }
+            if !self.keyboard_hook.is_null() {
+                UnhookWindowsHookEx(self.keyboard_hook);
+                self.keyboard_hook = null_mut();
             }
         }
     }
 
     fn rebind_hotkey(&mut self, control_id: i32, hotkey: Hotkey) {
-        let (registration_id, old) = match control_id {
-            ID_HOTKEY_CENTER => (HOTKEY_CENTER, self.config.center_hotkey),
-            ID_HOTKEY_HIDE => (HOTKEY_HIDE, self.config.hide_hotkey),
-            ID_HOTKEY_SHOW => (HOTKEY_SHOW, self.config.show_hotkey),
-            ID_HOTKEY_TOGGLE => (HOTKEY_TOGGLE, self.config.toggle_hotkey),
-            _ => return,
-        };
-        unsafe { UnregisterHotKey(self.settings, registration_id) };
-        if !hotkey.valid() || !register_hotkey(self.settings, registration_id, hotkey) {
-            register_hotkey(self.settings, registration_id, old);
-            message(
-                self.settings,
-                "This shortcut is already being used by Windows or another application. Use at least one modifier plus a non-modifier key.",
-                "Hotkey conflict",
-            );
-            self.update_hotkey_labels();
-            return;
-        }
-
         match control_id {
-            ID_HOTKEY_CENTER => self.config.center_hotkey = hotkey,
-            ID_HOTKEY_HIDE => self.config.hide_hotkey = hotkey,
-            ID_HOTKEY_SHOW => self.config.show_hotkey = hotkey,
-            ID_HOTKEY_TOGGLE => self.config.toggle_hotkey = hotkey,
-            _ => {}
+            ID_HOTKEY_CENTER => {
+                unsafe { UnregisterHotKey(self.settings, HOTKEY_CENTER) };
+                if !hotkey.valid() || !register_hotkey(self.settings, HOTKEY_CENTER, hotkey) {
+                    register_hotkey(self.settings, HOTKEY_CENTER, self.config.center_hotkey);
+                    message(
+                        self.settings,
+                        "This shortcut is already being used by Windows or another application. Use at least one modifier plus a non-modifier key.",
+                        "Hotkey conflict",
+                    );
+                    self.update_hotkey_labels();
+                    return;
+                }
+                self.config.center_hotkey = hotkey;
+            }
+            ID_HOTKEY_HIDE | ID_HOTKEY_BIND => {
+                if !hotkey.valid() {
+                    message(
+                        self.settings,
+                        "Use a mouse button, or at least one modifier plus a non-modifier key.",
+                        "Invalid shortcut",
+                    );
+                    self.update_hotkey_labels();
+                    return;
+                }
+                self.config.hide_hotkey = hotkey;
+                self.apply_hide_bind();
+            }
+            ID_HOTKEY_SHOW => {
+                if !hotkey.valid() {
+                    message(
+                        self.settings,
+                        "Use a mouse button, or at least one modifier plus a non-modifier key.",
+                        "Invalid shortcut",
+                    );
+                    self.update_hotkey_labels();
+                    return;
+                }
+                self.config.show_hotkey = hotkey;
+                self.apply_hide_bind();
+            }
+            _ => return,
         }
         self.update_hotkey_labels();
         self.save_config();
@@ -620,7 +889,7 @@ impl App {
             uID: 1,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: self.icon,
+            hIcon: self.small_icon,
             ..NOTIFYICONDATAW::default()
         };
         copy_wide(&mut self.tray.szTip, "LightCrosshair");
@@ -678,9 +947,9 @@ impl App {
         self.exiting = true;
         let _ = self.config.save();
         unsafe {
-            for id in HOTKEY_CENTER..=HOTKEY_TOGGLE {
-                UnregisterHotKey(self.settings, id);
-            }
+            UnregisterHotKey(self.settings, HOTKEY_CENTER);
+            UnregisterHotKey(self.settings, HOTKEY_HIDE);
+            self.remove_hooks();
             Shell_NotifyIconW(NIM_DELETE, &self.tray);
             if !self.overlay.is_null() {
                 DestroyWindow(self.overlay);
@@ -707,15 +976,17 @@ pub fn run() {
         }
 
         let instance = GetModuleHandleW(null());
-        let icon = create_app_icon();
-        register_window_classes(instance, icon);
+        let icon = create_app_icon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+        let small_icon =
+            create_app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        register_window_classes(instance, icon, small_icon);
         let controls = INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_BAR_CLASSES,
         };
         InitCommonControlsEx(&controls);
 
-        let mut app = Box::new(App::new(instance, icon));
+        let mut app = Box::new(App::new(instance, small_icon));
         let app_pointer = (&mut *app as *mut App).cast::<c_void>();
         let settings_class = wide(SETTINGS_CLASS);
         let title = wide("LightCrosshair Settings");
@@ -727,7 +998,7 @@ pub fn run() {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             540,
-            480,
+            684,
             null_mut(),
             null_mut(),
             instance,
@@ -786,15 +1057,15 @@ pub fn run() {
     }
 }
 
-unsafe fn create_app_icon() -> HICON {
+unsafe fn create_app_icon(width: i32, height: i32) -> HICON {
     let icon = unsafe {
         CreateIconFromResourceEx(
             APP_ICON_PNG.as_ptr(),
             APP_ICON_PNG.len() as u32,
             1,
             0x00030000,
-            GetSystemMetrics(SM_CXICON),
-            GetSystemMetrics(SM_CYICON),
+            width,
+            height,
             LR_DEFAULTCOLOR,
         )
     };
@@ -805,20 +1076,22 @@ unsafe fn create_app_icon() -> HICON {
     }
 }
 
-unsafe fn register_window_classes(instance: HINSTANCE, icon: HICON) {
+unsafe fn register_window_classes(instance: HINSTANCE, icon: HICON, small_icon: HICON) {
     let cursor = unsafe { LoadCursorW(null_mut(), IDC_ARROW) };
     let settings_name = wide(SETTINGS_CLASS);
-    let settings_class = WNDCLASSW {
+    let settings_class = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(settings_proc),
         hInstance: instance,
         hIcon: icon,
+        hIconSm: small_icon,
         hCursor: cursor,
         hbrBackground: (COLOR_WINDOW + 1) as _,
         lpszClassName: settings_name.as_ptr(),
         ..unsafe { zeroed() }
     };
-    unsafe { RegisterClassW(&settings_class) };
+    unsafe { RegisterClassExW(&settings_class) };
 
     let overlay_name = wide(OVERLAY_CLASS);
     let overlay_class = WNDCLASSW {
@@ -887,6 +1160,46 @@ unsafe extern "system" fn settings_proc(
                         }
                     }
                     (ID_SCALE_INPUT, EN_KILLFOCUS) => app.update_scale_display(true),
+                    (ID_OPACITY_INPUT, EN_CHANGE) if !app.initializing => {
+                        if let Some(opacity) =
+                            parse_percent_value(&get_text(app.controls.opacity_input))
+                            && opacity != app.config.opacity
+                        {
+                            app.config.opacity = opacity;
+                            SendMessageW(app.controls.opacity, TBM_SETPOS, 1, opacity as isize);
+                            app.update_opacity_display(false);
+                            app.redraw_overlay();
+                            app.save_config();
+                        }
+                    }
+                    (ID_OPACITY_INPUT, EN_KILLFOCUS) => app.update_opacity_display(true),
+                    (ID_OFFSET_X_INPUT, EN_CHANGE) if !app.initializing => {
+                        if let Some(offset) =
+                            parse_offset_px(&get_text(app.controls.offset_x_input))
+                            && offset != app.config.offset_x
+                        {
+                            app.config.offset_x = offset;
+                            SendMessageW(app.controls.offset_x, TBM_SETPOS, 1, offset as isize);
+                            app.update_offset_displays(false);
+                            app.redraw_overlay();
+                            app.save_config();
+                        }
+                    }
+                    (ID_OFFSET_X_INPUT, EN_KILLFOCUS) | (ID_OFFSET_Y_INPUT, EN_KILLFOCUS) => {
+                        app.update_offset_displays(true)
+                    }
+                    (ID_OFFSET_Y_INPUT, EN_CHANGE) if !app.initializing => {
+                        if let Some(offset) =
+                            parse_offset_px(&get_text(app.controls.offset_y_input))
+                            && offset != app.config.offset_y
+                        {
+                            app.config.offset_y = offset;
+                            SendMessageW(app.controls.offset_y, TBM_SETPOS, 1, offset as isize);
+                            app.update_offset_displays(false);
+                            app.redraw_overlay();
+                            app.save_config();
+                        }
+                    }
                     (ID_MONITOR, CBN_SELCHANGE) => {
                         let selected = SendMessageW(app.controls.monitor, CB_GETCURSEL, 0, 0);
                         if selected >= 0
@@ -897,10 +1210,24 @@ unsafe extern "system" fn settings_proc(
                             app.save_config();
                         }
                     }
-                    (ID_CENTER_NOW, BN_CLICKED) => app.center_overlay(),
+                    (ID_HIDE_MODE, CBN_SELCHANGE) => {
+                        let selected = SendMessageW(app.controls.hide_mode, CB_GETCURSEL, 0, 0);
+                        if (0..=2).contains(&selected) {
+                            app.config.hide_mode = match selected {
+                                1 => HideMode::Toggle,
+                                2 => HideMode::Hold,
+                                _ => HideMode::Off,
+                            };
+                            app.apply_hide_bind();
+                            app.update_hide_hint();
+                            app.update_hide_section();
+                            app.save_config();
+                        }
+                    }
+                    (ID_CENTER_NOW, BN_CLICKED) => app.reset_offsets_and_center(),
                     (ID_HIDE_NOW, BN_CLICKED) => app.set_visible(false),
                     (id, _) if id == MENU_SETTINGS as i32 => app.show_settings(),
-                    (id, _) if id == MENU_CENTER as i32 => app.center_overlay(),
+                    (id, _) if id == MENU_CENTER as i32 => app.reset_offsets_and_center(),
                     (id, _) if id == MENU_SHOW as i32 => app.set_visible(true),
                     (id, _) if id == MENU_HIDE as i32 => app.set_visible(false),
                     (id, _) if id == MENU_LOAD as i32 => {
@@ -912,20 +1239,66 @@ unsafe extern "system" fn settings_proc(
                 }
                 0
             }
-            WM_HSCROLL if wparam != 0 || lparam == app.controls.scale as isize => {
-                app.config.scale = SendMessageW(app.controls.scale, TBM_GETPOS, 0, 0) as u32;
-                app.update_scale_display(true);
-                app.rebuild_processed();
-                app.save_config();
-                0
+            WM_HSCROLL => {
+                let from = lparam as HWND;
+                if from == app.controls.scale {
+                    app.config.scale = SendMessageW(app.controls.scale, TBM_GETPOS, 0, 0) as u32;
+                    app.update_scale_display(true);
+                    app.rebuild_processed();
+                    app.save_config();
+                    0
+                } else if from == app.controls.opacity {
+                    app.config.opacity =
+                        SendMessageW(app.controls.opacity, TBM_GETPOS, 0, 0).max(0) as u32;
+                    app.update_opacity_display(true);
+                    app.redraw_overlay();
+                    app.save_config();
+                    0
+                } else if from == app.controls.offset_x || from == app.controls.offset_y {
+                    let position = SendMessageW(from, TBM_GETPOS, 0, 0) as i32;
+                    if from == app.controls.offset_x {
+                        app.config.offset_x = position;
+                    } else {
+                        app.config.offset_y = position;
+                    }
+                    app.update_offset_displays(true);
+                    app.redraw_overlay();
+                    app.save_config();
+                    0
+                } else {
+                    DefWindowProcW(hwnd, message_id, wparam, lparam)
+                }
             }
             WM_HOTKEY => {
                 match wparam as i32 {
-                    HOTKEY_CENTER => app.center_overlay(),
-                    HOTKEY_HIDE => app.set_visible(false),
-                    HOTKEY_SHOW => app.set_visible(true),
-                    HOTKEY_TOGGLE => app.set_visible(!app.config.visible),
+                    HOTKEY_CENTER => app.reset_offsets_and_center(),
+                    HOTKEY_HIDE if app.config.hide_mode == HideMode::Toggle => {
+                        app.set_visible(false);
+                    }
+                    HOTKEY_SHOW if app.config.hide_mode == HideMode::Toggle => {
+                        app.set_visible(true);
+                    }
                     _ => {}
+                }
+                0
+            }
+            WM_HIDE_TRIGGER_DOWN => {
+                let key = wparam as u32;
+                match app.config.hide_mode {
+                    HideMode::Toggle => {
+                        if key == app.config.show_hotkey.key {
+                            app.set_visible(true);
+                        } else {
+                            app.set_visible(false);
+                        }
+                    }
+                    _ => app.set_visible(false),
+                }
+                0
+            }
+            WM_HIDE_TRIGGER_UP => {
+                if app.config.hide_mode == HideMode::Hold {
+                    app.set_visible(true);
                 }
                 0
             }
@@ -1035,6 +1408,28 @@ unsafe extern "system" fn hotkey_edit_proc(
                     (*pointer).update_hotkey_labels();
                 }
             }
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
+                // Only capture a mouse button when the field already has focus;
+                // otherwise let the click focus the control like a normal edit.
+                if GetFocus() != hwnd {
+                    return DefSubclassProc(hwnd, message_id, wparam, lparam);
+                }
+                let key = match message_id {
+                    WM_LBUTTONDOWN => VK_MOUSE_LEFT,
+                    WM_RBUTTONDOWN => VK_MOUSE_RIGHT,
+                    WM_MBUTTONDOWN => VK_MOUSE_MIDDLE,
+                    _ => {
+                        if hiword(wparam) as usize == XBUTTON1_ID {
+                            VK_MOUSE_X1
+                        } else {
+                            VK_MOUSE_X2
+                        }
+                    }
+                };
+                let encoded = ((key as u64) << 32 | current_modifiers() as u64) as isize;
+                PostMessageW(GetParent(hwnd), WM_CAPTURED_HOTKEY, control_id, encoded);
+                return 0;
+            }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let key = wparam as u32;
                 if key == VK_ESCAPE as u32 {
@@ -1044,19 +1439,7 @@ unsafe extern "system" fn hotkey_edit_proc(
                 if [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN].contains(&(key as u16)) {
                     return 0;
                 }
-                let mut modifiers = 0;
-                if GetKeyState(VK_CONTROL as i32) < 0 {
-                    modifiers |= MOD_CONTROL;
-                }
-                if GetKeyState(VK_MENU as i32) < 0 {
-                    modifiers |= MOD_ALT;
-                }
-                if GetKeyState(VK_SHIFT as i32) < 0 {
-                    modifiers |= MOD_SHIFT;
-                }
-                if GetKeyState(VK_LWIN as i32) < 0 || GetKeyState(VK_RWIN as i32) < 0 {
-                    modifiers |= MOD_WIN;
-                }
+                let modifiers = current_modifiers();
                 let encoded = ((key as u64) << 32 | modifiers as u64) as isize;
                 PostMessageW(GetParent(hwnd), WM_CAPTURED_HOTKEY, control_id, encoded);
                 return 0;
@@ -1137,16 +1520,16 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             ID_TINT_PICK,
             font,
         );
-        create_label(app, hwnd, "Scale:", 24, 125, 58, 22, font);
+        create_label(app, hwnd, "Scale:", 24, 125, 68, 22, font);
         app.controls.scale = create_control(
             app,
             hwnd,
             "msctls_trackbar32",
             "",
             WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
-            80,
+            96,
             116,
-            270,
+            254,
             40,
             ID_SCALE,
             font,
@@ -1172,12 +1555,45 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             WS_CHILD | WS_VISIBLE,
             428,
             125,
-            80,
+            78,
             22,
             ID_SCALE_VALUE,
             font,
         );
-        create_label(app, hwnd, "Display:", 24, 170, 64, 22, font);
+        slider_row(
+            app,
+            hwnd,
+            "Opacity:",
+            163,
+            "100",
+            ID_OPACITY,
+            ID_OPACITY_INPUT,
+            ID_OPACITY_VALUE,
+            font,
+        );
+        slider_row(
+            app,
+            hwnd,
+            "X Offset:",
+            210,
+            "0",
+            ID_OFFSET_X,
+            ID_OFFSET_X_INPUT,
+            ID_OFFSET_X_VALUE,
+            font,
+        );
+        slider_row(
+            app,
+            hwnd,
+            "Y Offset:",
+            257,
+            "0",
+            ID_OFFSET_Y,
+            ID_OFFSET_Y_INPUT,
+            ID_OFFSET_Y_VALUE,
+            font,
+        );
+        create_label(app, hwnd, "Display:", 24, 313, 64, 22, font);
         app.controls.monitor = create_control(
             app,
             hwnd,
@@ -1185,20 +1601,100 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             "",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
             96,
-            166,
+            309,
             406,
             200,
             ID_MONITOR,
             font,
         );
 
-        create_label(app, hwnd, "Hotkeys", 18, 213, 490, 22, font);
-        app.controls.hotkey_center =
-            hotkey_control(app, hwnd, "Center:", 248, ID_HOTKEY_CENTER, font);
-        app.controls.hotkey_hide = hotkey_control(app, hwnd, "Hide:", 283, ID_HOTKEY_HIDE, font);
-        app.controls.hotkey_show = hotkey_control(app, hwnd, "Show:", 318, ID_HOTKEY_SHOW, font);
-        app.controls.hotkey_toggle =
-            hotkey_control(app, hwnd, "Toggle:", 353, ID_HOTKEY_TOGGLE, font);
+        create_label(app, hwnd, "Hide / Show", 18, 358, 490, 22, font);
+        create_label(app, hwnd, "Mode:", 24, 400, 52, 22, font);
+        app.controls.hide_mode = create_control(
+            app,
+            hwnd,
+            "COMBOBOX",
+            "",
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32,
+            80,
+            396,
+            150,
+            200,
+            ID_HIDE_MODE,
+            font,
+        );
+        for mode in ["Off", "Toggle", "Hold"] {
+            let wide_mode = wide(mode);
+            SendMessageW(
+                app.controls.hide_mode,
+                CB_ADDSTRING,
+                0,
+                wide_mode.as_ptr() as isize,
+            );
+        }
+        (app.controls.hotkey_bind_label, app.controls.hotkey_bind) = hotkey_control(
+            app,
+            hwnd,
+            "Bind:",
+            250,
+            46,
+            300,
+            202,
+            396,
+            ID_HOTKEY_BIND,
+            font,
+        );
+        (app.controls.hotkey_hide_label, app.controls.hotkey_hide) = hotkey_control(
+            app,
+            hwnd,
+            "Hide:",
+            24,
+            52,
+            80,
+            180,
+            434,
+            ID_HOTKEY_HIDE,
+            font,
+        );
+        (app.controls.hotkey_show_label, app.controls.hotkey_show) = hotkey_control(
+            app,
+            hwnd,
+            "Show:",
+            284,
+            52,
+            340,
+            162,
+            434,
+            ID_HOTKEY_SHOW,
+            font,
+        );
+        app.controls.hide_hint = create_control(
+            app,
+            hwnd,
+            "STATIC",
+            "Hide/show binds are disabled.",
+            WS_CHILD | WS_VISIBLE,
+            24,
+            472,
+            478,
+            34,
+            ID_HIDE_HINT,
+            font,
+        );
+
+        create_label(app, hwnd, "Hotkeys", 18, 522, 490, 22, font);
+        (_, app.controls.hotkey_center) = hotkey_control(
+            app,
+            hwnd,
+            "Center:",
+            24,
+            70,
+            96,
+            228,
+            557,
+            ID_HOTKEY_CENTER,
+            font,
+        );
 
         create_control(
             app,
@@ -1207,7 +1703,7 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             "Center Now",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
             24,
-            400,
+            600,
             126,
             30,
             ID_CENTER_NOW,
@@ -1220,7 +1716,7 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             "Hide Crosshair",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
             164,
-            400,
+            600,
             132,
             30,
             ID_HIDE_NOW,
@@ -1229,31 +1725,114 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+unsafe fn slider_row(
+    app: &mut App,
+    parent: HWND,
+    label: &str,
+    top: i32,
+    initial_input: &str,
+    slider_id: i32,
+    input_id: i32,
+    value_id: i32,
+    font: HFONT,
+) {
+    unsafe {
+        create_label(app, parent, label, 24, top + 9, 68, 22, font);
+        let slider = create_control(
+            app,
+            parent,
+            "msctls_trackbar32",
+            "",
+            WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
+            96,
+            top,
+            254,
+            40,
+            slider_id,
+            font,
+        );
+        let input = create_control(
+            app,
+            parent,
+            "EDIT",
+            initial_input,
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL as u32 | ES_CENTER as u32,
+            358,
+            top + 6,
+            64,
+            25,
+            input_id,
+            font,
+        );
+        let value = create_control(
+            app,
+            parent,
+            "STATIC",
+            "",
+            WS_CHILD | WS_VISIBLE,
+            428,
+            top + 9,
+            78,
+            22,
+            value_id,
+            font,
+        );
+        match slider_id {
+            ID_SCALE => {
+                app.controls.scale = slider;
+                app.controls.scale_input = input;
+                app.controls.scale_value = value;
+            }
+            ID_OPACITY => {
+                app.controls.opacity = slider;
+                app.controls.opacity_input = input;
+                app.controls.opacity_value = value;
+            }
+            ID_OFFSET_X => {
+                app.controls.offset_x = slider;
+                app.controls.offset_x_input = input;
+                app.controls.offset_x_value = value;
+            }
+            _ => {
+                app.controls.offset_y = slider;
+                app.controls.offset_y_input = input;
+                app.controls.offset_y_value = value;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 unsafe fn hotkey_control(
     app: &App,
     parent: HWND,
     label: &str,
+    label_x: i32,
+    label_width: i32,
+    edit_x: i32,
+    edit_width: i32,
     y: i32,
     id: i32,
     font: HFONT,
-) -> HWND {
+) -> (HWND, HWND) {
     unsafe {
-        create_label(app, parent, label, 24, y + 4, 66, 22, font);
+        let label = create_label(app, parent, label, label_x, y + 4, label_width, 22, font);
         let control = create_control(
             app,
             parent,
             "EDIT",
             "",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY as u32 | ES_CENTER as u32,
-            96,
+            edit_x,
             y,
-            228,
+            edit_width,
             27,
             id,
             font,
         );
         SetWindowSubclass(control, Some(hotkey_edit_proc), 1, id as usize);
-        control
+        (label, control)
     }
 }
 
@@ -1365,11 +1944,157 @@ fn enumerate_monitors() -> Vec<Monitor> {
     monitors
 }
 
-fn centered_position(monitor: &Monitor, width: i32, height: i32) -> (i32, i32) {
+fn centered_position(
+    monitor: &Monitor,
+    width: i32,
+    height: i32,
+    offset_x: i32,
+    offset_y: i32,
+) -> (i32, i32) {
     (
-        monitor.left + (monitor.width - width) / 2,
-        monitor.top + (monitor.height - height) / 2,
+        monitor.left + (monitor.width - width) / 2 + offset_x,
+        monitor.top + (monitor.height - height) / 2 + offset_y,
     )
+}
+
+fn hide_section_visibility(mode: HideMode) -> (bool, bool) {
+    match mode {
+        HideMode::Off => (false, false),
+        HideMode::Toggle => (false, true),
+        HideMode::Hold => (true, false),
+    }
+}
+
+fn current_modifiers() -> u32 {
+    let mut modifiers = 0;
+    unsafe {
+        if GetKeyState(VK_CONTROL as i32) < 0 {
+            modifiers |= MOD_CONTROL;
+        }
+        if GetKeyState(VK_MENU as i32) < 0 {
+            modifiers |= MOD_ALT;
+        }
+        if GetKeyState(VK_SHIFT as i32) < 0 {
+            modifiers |= MOD_SHIFT;
+        }
+        if GetKeyState(VK_LWIN as i32) < 0 || GetKeyState(VK_RWIN as i32) < 0 {
+            modifiers |= MOD_WIN;
+        }
+    }
+    modifiers
+}
+
+/// True when exactly the required modifier set is held down.
+fn hide_modifiers_active(required: u32) -> bool {
+    let mut held = 0;
+    unsafe {
+        if GetAsyncKeyState(VK_CONTROL as i32) < 0 {
+            held |= MOD_CONTROL;
+        }
+        if GetAsyncKeyState(VK_MENU as i32) < 0 {
+            held |= MOD_ALT;
+        }
+        if GetAsyncKeyState(VK_SHIFT as i32) < 0 {
+            held |= MOD_SHIFT;
+        }
+        if GetAsyncKeyState(VK_LWIN as i32) < 0 || GetAsyncKeyState(VK_RWIN as i32) < 0 {
+            held |= MOD_WIN;
+        }
+    }
+    required & !held == 0 && held & !required == 0
+}
+
+/// Forwards a matching trigger transition from a low-level hook to the
+/// settings window; deduplicates keyboard auto-repeat. The bound key is
+/// posted so the window can tell the hide and show triggers apart.
+fn handle_hide_trigger(key: u32, pressed: bool) {
+    if key == 0 {
+        return;
+    }
+    let (modifiers, was_pressed) = if key == HIDE_HOOK_KEY.load(Ordering::Relaxed) {
+        (
+            HIDE_HOOK_MODIFIERS.load(Ordering::Relaxed),
+            HIDE_HOOK_PRESSED.load(Ordering::Relaxed),
+        )
+    } else if key == HIDE_HOOK_SHOW_KEY.load(Ordering::Relaxed) {
+        (
+            HIDE_HOOK_SHOW_MODIFIERS.load(Ordering::Relaxed),
+            HIDE_HOOK_SHOW_PRESSED.load(Ordering::Relaxed),
+        )
+    } else {
+        return;
+    };
+    if !hide_modifiers_active(modifiers) {
+        return;
+    }
+    let window = HIDE_HOOK_WINDOW.load(Ordering::Relaxed) as HWND;
+    if window.is_null() {
+        return;
+    }
+    let message_id = if pressed {
+        if was_pressed {
+            return;
+        }
+        WM_HIDE_TRIGGER_DOWN
+    } else {
+        if !was_pressed {
+            return;
+        }
+        WM_HIDE_TRIGGER_UP
+    };
+    if key == HIDE_HOOK_KEY.load(Ordering::Relaxed) {
+        HIDE_HOOK_PRESSED.store(pressed, Ordering::Relaxed);
+    } else {
+        HIDE_HOOK_SHOW_PRESSED.store(pressed, Ordering::Relaxed);
+    }
+    unsafe { PostMessageW(window, message_id, key as usize, 0) };
+}
+
+unsafe extern "system" fn hide_mouse_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code >= 0 {
+        let message_id = wparam as u32;
+        let key = match message_id {
+            WM_LBUTTONDOWN | WM_LBUTTONUP => VK_MOUSE_LEFT,
+            WM_RBUTTONDOWN | WM_RBUTTONUP => VK_MOUSE_RIGHT,
+            WM_MBUTTONDOWN | WM_MBUTTONUP => VK_MOUSE_MIDDLE,
+            WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                let data = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+                if (data.mouseData >> 16) & 0xFFFF == XBUTTON1_ID as u32 {
+                    VK_MOUSE_X1
+                } else {
+                    VK_MOUSE_X2
+                }
+            }
+            _ => 0,
+        };
+        let pressed = matches!(
+            message_id,
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+        );
+        handle_hide_trigger(key, pressed);
+    }
+    unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
+}
+
+unsafe extern "system" fn hide_keyboard_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code >= 0 {
+        let message_id = wparam as u32;
+        let pressed = message_id == WM_KEYDOWN || message_id == WM_SYSKEYDOWN;
+        let released = message_id == WM_KEYUP || message_id == WM_SYSKEYUP;
+        if pressed || released {
+            let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+            handle_hide_trigger(info.vkCode, pressed);
+        }
+    }
+    unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }
 
 fn parse_scale_percent(value: &str) -> Option<u32> {
@@ -1384,6 +2109,24 @@ fn parse_scale_percent(value: &str) -> Option<u32> {
         return None;
     }
     Some((multiplier * 100.0).round() as u32)
+}
+
+fn parse_percent_value(value: &str) -> Option<u32> {
+    let value = value.trim().strip_suffix('%').unwrap_or(value.trim());
+    let percent = value.parse::<f64>().ok()?;
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+        return None;
+    }
+    Some(percent.round() as u32)
+}
+
+fn parse_offset_px(value: &str) -> Option<i32> {
+    let value = value.trim();
+    let value = value.strip_suffix("px").unwrap_or(value).trim();
+    let offset = value.parse::<i32>().ok()?;
+    (MIN_OFFSET_PX..=MAX_OFFSET_PX)
+        .contains(&offset)
+        .then_some(offset)
 }
 
 fn register_hotkey(window: HWND, id: i32, hotkey: Hotkey) -> bool {
@@ -1436,7 +2179,11 @@ fn make_lparam(low: u16, high: u16) -> isize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Monitor, centered_position, parse_scale_percent};
+    use super::{
+        Monitor, centered_position, hide_section_visibility, parse_offset_px, parse_percent_value,
+        parse_scale_percent,
+    };
+    use crate::config::HideMode;
 
     #[test]
     fn centers_even_and_odd_sizes_in_physical_pixels() {
@@ -1448,8 +2195,21 @@ mod tests {
             height: 1080,
             primary: false,
         };
-        assert_eq!(centered_position(&monitor, 32, 32), (-976, 524));
-        assert_eq!(centered_position(&monitor, 33, 33), (-977, 523));
+        assert_eq!(centered_position(&monitor, 32, 32, 0, 0), (-976, 524));
+        assert_eq!(centered_position(&monitor, 33, 33, 0, 0), (-977, 523));
+    }
+
+    #[test]
+    fn offsets_shift_the_centered_position() {
+        let monitor = Monitor {
+            device: String::new(),
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        };
+        assert_eq!(centered_position(&monitor, 32, 32, 10, -20), (954, 504));
     }
 
     #[test]
@@ -1459,5 +2219,30 @@ mod tests {
         assert_eq!(parse_scale_percent("5.00"), Some(500));
         assert_eq!(parse_scale_percent("5.01"), None);
         assert_eq!(parse_scale_percent("nope"), None);
+    }
+
+    #[test]
+    fn parses_opacity_percent() {
+        assert_eq!(parse_percent_value("100"), Some(100));
+        assert_eq!(parse_percent_value("42%"), Some(42));
+        assert_eq!(parse_percent_value(" 7 "), Some(7));
+        assert_eq!(parse_percent_value("101"), None);
+        assert_eq!(parse_percent_value("-1"), None);
+    }
+
+    #[test]
+    fn parses_offset_pixels() {
+        assert_eq!(parse_offset_px("0"), Some(0));
+        assert_eq!(parse_offset_px("-100"), Some(-100));
+        assert_eq!(parse_offset_px("+42px"), Some(42));
+        assert_eq!(parse_offset_px("101px"), None);
+        assert_eq!(parse_offset_px("x"), None);
+    }
+
+    #[test]
+    fn shows_only_binds_used_by_the_selected_hide_mode() {
+        assert_eq!(hide_section_visibility(HideMode::Off), (false, false));
+        assert_eq!(hide_section_visibility(HideMode::Toggle), (false, true));
+        assert_eq!(hide_section_visibility(HideMode::Hold), (true, false));
     }
 }

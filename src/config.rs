@@ -6,9 +6,22 @@ use crate::hotkeys::Hotkey;
 
 pub const MIN_SCALE_PERCENT: u32 = 0;
 pub const MAX_SCALE_PERCENT: u32 = 500;
+pub const MIN_OPACITY_PERCENT: u32 = 0;
+pub const MAX_OPACITY_PERCENT: u32 = 100;
+pub const MIN_OFFSET_PX: i32 = -100;
+pub const MAX_OFFSET_PX: i32 = 100;
 
 fn legacy_scale_version() -> u8 {
     1
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HideMode {
+    #[default]
+    Off,
+    Toggle,
+    Hold,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -20,11 +33,14 @@ pub struct Config {
     #[serde(default = "legacy_scale_version")]
     scale_version: u8,
     pub scale: u32,
+    pub opacity: u32,
+    pub offset_x: i32,
+    pub offset_y: i32,
     pub monitor: String,
     pub center_hotkey: Hotkey,
     pub hide_hotkey: Hotkey,
     pub show_hotkey: Hotkey,
-    pub toggle_hotkey: Hotkey,
+    pub hide_mode: HideMode,
     pub visible: bool,
 }
 
@@ -36,11 +52,14 @@ impl Default for Config {
             tint: "#00FF00".into(),
             scale_version: 2,
             scale: 100,
+            opacity: 100,
+            offset_x: 0,
+            offset_y: 0,
             monitor: String::new(),
             center_hotkey: Hotkey::ctrl_alt(b'C'),
             hide_hotkey: Hotkey::ctrl_alt(b'H'),
             show_hotkey: Hotkey::ctrl_alt(b'S'),
-            toggle_hotkey: Hotkey::ctrl_alt(b'X'),
+            hide_mode: HideMode::Off,
             visible: true,
         }
     }
@@ -57,6 +76,11 @@ impl Config {
             Ok(mut config) => {
                 let defaults = Self::default();
                 config.normalize_scale();
+                config.opacity = config
+                    .opacity
+                    .clamp(MIN_OPACITY_PERCENT, MAX_OPACITY_PERCENT);
+                config.offset_x = config.offset_x.clamp(MIN_OFFSET_PX, MAX_OFFSET_PX);
+                config.offset_y = config.offset_y.clamp(MIN_OFFSET_PX, MAX_OFFSET_PX);
                 if parse_hex(&config.tint).is_none() {
                     config.tint = defaults.tint;
                 }
@@ -68,9 +92,6 @@ impl Config {
                 }
                 if !config.show_hotkey.valid() {
                     config.show_hotkey = defaults.show_hotkey;
-                }
-                if !config.toggle_hotkey.valid() {
-                    config.toggle_hotkey = defaults.toggle_hotkey;
                 }
                 config
             }
@@ -87,6 +108,11 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, serde_json::to_vec_pretty(self)?)
+    }
+
+    pub fn reset_offsets(&mut self) {
+        self.offset_x = 0;
+        self.offset_y = 0;
     }
 
     fn normalize_scale(&mut self) {
@@ -121,7 +147,7 @@ pub fn parse_hex(text: &str) -> Option<[u8; 3]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, parse_hex};
+    use super::{Config, HideMode, MAX_OFFSET_PX, MAX_OPACITY_PERCENT, MIN_OFFSET_PX, parse_hex};
 
     #[test]
     fn parses_only_six_digit_rgb() {
@@ -137,5 +163,39 @@ mod tests {
         config.normalize_scale();
         assert_eq!(config.scale, 150);
         assert_eq!(config.scale_version, 2);
+    }
+
+    #[test]
+    fn legacy_config_gains_new_defaults() {
+        let config: Config = serde_json::from_str(r#"{"scale": 100}"#).unwrap();
+        assert_eq!(config.opacity, 100);
+        assert_eq!(config.offset_x, 0);
+        assert_eq!(config.offset_y, 0);
+        assert_eq!(config.hide_mode, HideMode::Off);
+        assert_eq!(config.hide_hotkey.key, b'H' as u32);
+        assert_eq!(config.show_hotkey.key, b'S' as u32);
+    }
+
+    #[test]
+    fn clamps_opacity_and_offsets_into_range() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"opacity": 900, "offset_x": -500, "offset_y": 999}"#).unwrap();
+        config.opacity = config.opacity.clamp(0, MAX_OPACITY_PERCENT);
+        config.offset_x = config.offset_x.clamp(MIN_OFFSET_PX, MAX_OFFSET_PX);
+        config.offset_y = config.offset_y.clamp(MIN_OFFSET_PX, MAX_OFFSET_PX);
+        assert_eq!(config.opacity, 100);
+        assert_eq!(config.offset_x, -100);
+        assert_eq!(config.offset_y, 100);
+    }
+
+    #[test]
+    fn centering_resets_offsets() {
+        let mut config = Config {
+            offset_x: 42,
+            offset_y: -17,
+            ..Config::default()
+        };
+        config.reset_offsets();
+        assert_eq!((config.offset_x, config.offset_y), (0, 0));
     }
 }

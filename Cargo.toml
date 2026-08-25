@@ -1,6 +1,6 @@
 [package]
 name = "LightCrosshair"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 description = "A tiny native Windows crosshair overlay"
 license = "MIT"
@@ -10,6 +10,9 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
