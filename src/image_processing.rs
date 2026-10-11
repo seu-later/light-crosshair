@@ -38,7 +38,12 @@ impl OriginalImage {
         })
     }
 
-    pub fn process(&self, tint: Option<[u8; 3]>, scale_percent: u32) -> ProcessedImage {
+    pub fn process(
+        &self,
+        tint: Option<[u8; 3]>,
+        tint_exact: bool,
+        scale_percent: u32,
+    ) -> ProcessedImage {
         let scale_percent = scale_percent.clamp(MIN_SCALE_PERCENT, MAX_SCALE_PERCENT);
         let width = scaled_dimension(self.width, scale_percent);
         let height = scaled_dimension(self.height, scale_percent);
@@ -56,9 +61,15 @@ impl OriginalImage {
                 let mut blue = self.rgba[source + 2] as u16;
 
                 if let Some(tint) = tint {
-                    red = (red * tint[0] as u16 + 127) / 255;
-                    green = (green * tint[1] as u16 + 127) / 255;
-                    blue = (blue * tint[2] as u16 + 127) / 255;
+                    if tint_exact {
+                        red = tint[0] as u16;
+                        green = tint[1] as u16;
+                        blue = tint[2] as u16;
+                    } else {
+                        red = (red * tint[0] as u16 + 127) / 255;
+                        green = (green * tint[1] as u16 + 127) / 255;
+                        blue = (blue * tint[2] as u16 + 127) / 255;
+                    }
                 }
 
                 output[destination] = ((blue * alpha + 127) / 255) as u8;
@@ -106,8 +117,21 @@ mod tests {
             height: 1,
             rgba: vec![255, 255, 255, 128],
         };
-        let processed = image.process(Some([255, 0, 0]), 100);
+        let processed = image.process(Some([255, 0, 0]), false, 100);
         assert_eq!(processed.premultiplied_bgra, [0, 0, 128, 128]);
+    }
+
+    #[test]
+    fn exact_tint_replaces_non_white_source() {
+        let image = OriginalImage {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 255],
+        };
+        let multiplied = image.process(Some([0, 255, 0]), false, 100);
+        assert_eq!(multiplied.premultiplied_bgra, [0, 0, 0, 255]);
+        let replaced = image.process(Some([0, 255, 0]), true, 100);
+        assert_eq!(replaced.premultiplied_bgra, [0, 255, 0, 255]);
     }
 
     #[test]
@@ -117,7 +141,7 @@ mod tests {
             height: 1,
             rgba: vec![255, 0, 0, 255, 0, 0, 255, 255],
         };
-        let processed = image.process(None, 200);
+        let processed = image.process(None, false, 200);
         assert_eq!(processed.premultiplied_bgra[0..4], [0, 0, 255, 255]);
         assert_eq!(processed.premultiplied_bgra[4..8], [0, 0, 255, 255]);
         assert_eq!(processed.premultiplied_bgra[8..12], [255, 0, 0, 255]);

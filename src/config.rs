@@ -29,6 +29,7 @@ pub enum HideMode {
 pub struct Config {
     pub image_path: Option<PathBuf>,
     pub tint_enabled: bool,
+    pub tint_exact: bool,
     pub tint: String,
     #[serde(default = "legacy_scale_version")]
     scale_version: u8,
@@ -49,6 +50,7 @@ impl Default for Config {
         Self {
             image_path: None,
             tint_enabled: false,
+            tint_exact: false,
             tint: "#00FF00".into(),
             scale_version: 2,
             scale: 100,

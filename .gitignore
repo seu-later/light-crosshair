@@ -1,2 +1,5 @@
 /target/
-
+/.cache/
+/gamebar/LightCrosshairGameBar/bin/
+/gamebar/LightCrosshairGameBar/obj/
+/gamebar/LightCrosshairGameBar/AppPackages/

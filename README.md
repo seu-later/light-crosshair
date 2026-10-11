@@ -24,6 +24,8 @@ Default global shortcuts:
 
 Click a shortcut field and press a new combination to rebind it; with the field focused, clicking it again captures mouse buttons too (left, right, middle, and both side buttons). Windows reports a clear error if another application already owns the shortcut.
 
+The bottom row holds Center + Reset (zero X/Y offsets and recenter), a Hide/Show toggle button whose label follows the current visibility state, and Exit. Closing Settings hides to the tray. The tray menu mirrors the same actions and greys out the inapplicable Show/Hide entry.
+
 ## Hide / Show
 
 The hide/show binds are disabled by default. Pick a mode in the settings window:
@@ -40,6 +42,8 @@ Keyboard binds use native hotkey registration where possible; mouse buttons and 
 
 - PNG is decoded once and retained in memory.
 - Tint multiplies the source RGB channels by the selected color while preserving alpha. A white pixel therefore becomes the exact tint color; black remains black.
+- Exact mode replaces every opaque pixel with the tint color while keeping the source alpha mask, so non-white PNGs recolor cleanly (red source + green tint yields green, not black). Leave Exact off for multiply/filter behavior.
+- The image label shows filename with dimensions (e.g. `cross.png (32x32)`), Clear unloads the image and frees its buffers, and an invalid hex entry reverts to the last valid color on focus loss instead of failing silently.
 - Scale ranges from `0.00x` through `5.00x`. Use the slider or type an exact multiplier in the scale box; `0.00x` hides the overlay without unloading the image.
 - Opacity ranges from `0%` through `100%` with its own slider and text box.
 - X/Y offset sliders shift the crosshair up to 100 pixels away from the monitor center in either direction. Centering resets both offsets to zero.
@@ -71,6 +75,20 @@ cargo test
 ```
 
 Release builds use fat LTO, one codegen unit, stripped symbols, and abort-on-panic.
+
+## Xbox Game Bar build
+
+`gamebar\LightCrosshairGameBar` is a separate Xbox Game Bar widget build. Game Bar hosts its pinned widget in its own overlay space, so it is the supported alternative for games where a normal desktop overlay is not visible.
+
+It retains PNG loading, tint, scale, opacity, X/Y offset, visibility, and editable center/hide/show shortcuts. Game Bar controls the widget’s monitor and final position: use the Center shortcut (`Ctrl+Alt+C` by default) and then pin it from the widget title bar. The Game Bar API does not permit an app to choose a monitor or force the pin state.
+
+Build the debug package with the Visual Studio UWP build tools:
+
+```powershell
+msbuild gamebar\LightCrosshairGameBar\LightCrosshairGameBar.csproj /restore /p:Configuration=Debug /p:Platform=x64
+```
+
+The package is an MSIX/AppX-style UWP artifact rather than a portable executable. For a local Debug build, right-click `gamebar\LightCrosshairGameBar\Install-GameBar.ps1` and choose **Run with PowerShell**; do not open the `.msix` or the generated `Install.ps1` by itself. The project installer trusts the development certificate and supplies the matching x64 framework dependencies without invoking the obsolete developer-license flow. Approve its administrator prompt only for a package you built yourself. A distributed build should use a Microsoft Store signing identity. Game Bar availability remains game- and system-dependent.
 
 ## Windows limitations
 

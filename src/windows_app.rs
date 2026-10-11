@@ -15,7 +15,7 @@ use windows_sys::Win32::{
         AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
         COLOR_WINDOW, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,
         EnumDisplayMonitors, GetMonitorInfoW, GetStockObject, HDC, HFONT, HGDIOBJ, HMONITOR,
-        InvalidateRect, MONITORINFO, MONITORINFOEXW, SelectObject,
+        MONITORINFO, MONITORINFOEXW, SelectObject,
     },
     System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
     UI::{
@@ -29,9 +29,9 @@ use windows_sys::Win32::{
         },
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, GetFocus, GetKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
-            MOD_WIN, RegisterHotKey, SetFocus, UnregisterHotKey, VK_CONTROL, VK_ESCAPE, VK_LWIN,
-            VK_MENU, VK_RWIN, VK_SHIFT,
+            EnableWindow, GetAsyncKeyState, GetFocus, GetKeyState, MOD_ALT, MOD_CONTROL,
+            MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, SetFocus, UnregisterHotKey,
+            VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
         },
         Shell::{
             DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
@@ -66,6 +66,8 @@ const ID_LOAD: i32 = 1001;
 const ID_TINT_ENABLED: i32 = 1002;
 const ID_TINT_HEX: i32 = 1003;
 const ID_TINT_PICK: i32 = 1004;
+const ID_TINT_EXACT: i32 = 1020;
+const ID_CLEAR: i32 = 1021;
 const ID_SCALE: i32 = 1005;
 const ID_SCALE_VALUE: i32 = 1006;
 const ID_MONITOR: i32 = 1007;
@@ -80,13 +82,13 @@ const ID_OFFSET_Y: i32 = 1015;
 const ID_OFFSET_Y_INPUT: i32 = 1016;
 const ID_OFFSET_Y_VALUE: i32 = 1017;
 const ID_HIDE_MODE: i32 = 1018;
-const ID_HIDE_HINT: i32 = 1019;
 const ID_HOTKEY_CENTER: i32 = 1101;
 const ID_HOTKEY_HIDE: i32 = 1102;
 const ID_HOTKEY_SHOW: i32 = 1103;
 const ID_HOTKEY_BIND: i32 = 1104;
 const ID_CENTER_NOW: i32 = 1201;
 const ID_HIDE_NOW: i32 = 1202;
+const ID_EXIT: i32 = 1203;
 
 const MENU_SETTINGS: usize = 2001;
 const MENU_CENTER: usize = 2002;
@@ -133,7 +135,9 @@ struct Monitor {
 struct Controls {
     image_name: HWND,
     tint_enabled: HWND,
+    tint_exact: HWND,
     tint_hex: HWND,
+    tint_pick: HWND,
     scale: HWND,
     scale_input: HWND,
     scale_value: HWND,
@@ -148,7 +152,6 @@ struct Controls {
     offset_y_value: HWND,
     monitor: HWND,
     hide_mode: HWND,
-    hide_hint: HWND,
     hotkey_center: HWND,
     hotkey_hide_label: HWND,
     hotkey_hide: HWND,
@@ -156,6 +159,7 @@ struct Controls {
     hotkey_show: HWND,
     hotkey_bind_label: HWND,
     hotkey_bind: HWND,
+    hide_now: HWND,
 }
 
 impl Default for Controls {
@@ -163,7 +167,9 @@ impl Default for Controls {
         Self {
             image_name: null_mut(),
             tint_enabled: null_mut(),
+            tint_exact: null_mut(),
             tint_hex: null_mut(),
+            tint_pick: null_mut(),
             scale: null_mut(),
             scale_input: null_mut(),
             scale_value: null_mut(),
@@ -178,7 +184,6 @@ impl Default for Controls {
             offset_y_value: null_mut(),
             monitor: null_mut(),
             hide_mode: null_mut(),
-            hide_hint: null_mut(),
             hotkey_center: null_mut(),
             hotkey_hide_label: null_mut(),
             hotkey_hide: null_mut(),
@@ -186,6 +191,7 @@ impl Default for Controls {
             hotkey_show: null_mut(),
             hotkey_bind_label: null_mut(),
             hotkey_bind: null_mut(),
+            hide_now: null_mut(),
         }
     }
 }
@@ -268,6 +274,16 @@ impl App {
                 0,
             );
             set_text(self.controls.tint_hex, &self.config.tint);
+            SendMessageW(
+                self.controls.tint_exact,
+                BM_SETCHECK,
+                if self.config.tint_exact {
+                    BST_CHECKED as usize
+                } else {
+                    BST_UNCHECKED as usize
+                },
+                0,
+            );
             self.update_slider(
                 self.controls.scale,
                 MIN_SCALE_PERCENT as i32,
@@ -297,9 +313,10 @@ impl App {
             self.update_offset_displays(true);
             let mode = self.config.hide_mode as usize;
             SendMessageW(self.controls.hide_mode, CB_SETCURSEL, mode, 0);
-            self.update_hide_hint();
             self.update_hide_section();
             self.update_hotkey_labels();
+            self.update_tint_controls();
+            self.update_hide_now_button();
         }
     }
 
@@ -320,10 +337,7 @@ impl App {
             );
             self.initializing = was_initializing;
         }
-        set_text(
-            self.controls.scale_value,
-            &format!("x  ({}%)", self.config.scale),
-        );
+        set_text(self.controls.scale_value, "x");
     }
 
     fn update_opacity_display(&mut self, update_input: bool) {
@@ -336,10 +350,7 @@ impl App {
             );
             self.initializing = was_initializing;
         }
-        set_text(
-            self.controls.opacity_value,
-            &format!("{}%", self.config.opacity),
-        );
+        set_text(self.controls.opacity_value, "%");
     }
 
     fn update_offset_displays(&mut self, update_inputs: bool) {
@@ -360,32 +371,48 @@ impl App {
         set_text(self.controls.offset_y_value, "px");
     }
 
-    fn update_hide_hint(&mut self) {
-        let hint = match self.config.hide_mode {
-            HideMode::Off => "Hide/show binds are disabled.",
-            HideMode::Toggle => {
-                "Press the Hide shortcut or mouse button to hide the crosshair; press the Show one to display it again."
-            }
-            HideMode::Hold => {
-                "Hold the shortcut or mouse button down to hide the crosshair; release it to show again."
-            }
-        };
-        set_text(self.controls.hide_hint, hint);
-        unsafe { InvalidateRect(self.controls.hide_hint, null(), 1) };
+    /// Enables only the fields used by the selected mode. All rows stay
+    /// visible so the layout never jumps and Off leaves no dead space:
+    /// Hold uses the single bind, Toggle uses the hide/show pair.
+    fn update_hide_section(&mut self) {
+        let (enable_bind, enable_pair) = hide_section_enabled(self.config.hide_mode);
+        unsafe {
+            ShowWindow(self.controls.hotkey_bind_label, 1);
+            ShowWindow(self.controls.hotkey_bind, 1);
+            ShowWindow(self.controls.hotkey_hide_label, 1);
+            ShowWindow(self.controls.hotkey_hide, 1);
+            ShowWindow(self.controls.hotkey_show_label, 1);
+            ShowWindow(self.controls.hotkey_show, 1);
+            EnableWindow(self.controls.hotkey_bind_label, enable_bind as i32);
+            EnableWindow(self.controls.hotkey_bind, enable_bind as i32);
+            EnableWindow(self.controls.hotkey_hide_label, enable_pair as i32);
+            EnableWindow(self.controls.hotkey_hide, enable_pair as i32);
+            EnableWindow(self.controls.hotkey_show_label, enable_pair as i32);
+            EnableWindow(self.controls.hotkey_show, enable_pair as i32);
+        }
     }
 
-    /// Shows the fields that matter for the selected mode: Hold uses the
-    /// single bind, Toggle uses the separate hide/show pair, Off hides all.
-    fn update_hide_section(&mut self) {
-        let (show_bind, show_pair) = hide_section_visibility(self.config.hide_mode);
+    fn update_tint_controls(&self) {
         unsafe {
-            ShowWindow(self.controls.hotkey_bind_label, show_bind as i32);
-            ShowWindow(self.controls.hotkey_bind, show_bind as i32);
-            ShowWindow(self.controls.hotkey_hide_label, show_pair as i32);
-            ShowWindow(self.controls.hotkey_hide, show_pair as i32);
-            ShowWindow(self.controls.hotkey_show_label, show_pair as i32);
-            ShowWindow(self.controls.hotkey_show, show_pair as i32);
+            let enabled = self.config.tint_enabled as i32;
+            EnableWindow(self.controls.tint_hex, enabled);
+            EnableWindow(self.controls.tint_pick, enabled);
+            EnableWindow(self.controls.tint_exact, enabled);
         }
+    }
+
+    fn update_hide_now_button(&self) {
+        if self.controls.hide_now.is_null() {
+            return;
+        }
+        set_text(
+            self.controls.hide_now,
+            if self.config.visible {
+                "Hide Crosshair"
+            } else {
+                "Show Crosshair"
+            },
+        );
     }
 
     fn update_hotkey_labels(&self) {
@@ -468,6 +495,29 @@ impl App {
             .and_then(|index| self.monitors.get(index))
     }
 
+    fn image_label(&self) -> String {
+        let file = self
+            .config
+            .image_path
+            .as_ref()
+            .and_then(|value| value.file_name())
+            .and_then(|value| value.to_str())
+            .unwrap_or("No image selected");
+        match &self.original {
+            Some(image) => format!("{file} ({}x{})", image.width, image.height),
+            None => file.to_string(),
+        }
+    }
+
+    fn clear_image(&mut self) {
+        self.original = None;
+        self.processed = None;
+        self.config.image_path = None;
+        unsafe { ShowWindow(self.overlay, SW_HIDE) };
+        set_text(self.controls.image_name, &self.image_label());
+        self.save_config();
+    }
+
     fn load_image(&mut self, path: PathBuf, user_selected: bool) -> bool {
         match OriginalImage::load_png(&path) {
             Ok(image) => {
@@ -475,15 +525,8 @@ impl App {
                 self.config.image_path = Some(path);
                 self.rebuild_processed();
                 self.save_config();
-                set_text(
-                    self.controls.image_name,
-                    self.config
-                        .image_path
-                        .as_ref()
-                        .and_then(|value| value.file_name())
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("Crosshair loaded"),
-                );
+                let label = self.image_label();
+                set_text(self.controls.image_name, &label);
                 true
             }
             Err(_) => {
@@ -521,7 +564,7 @@ impl App {
         } else {
             self.original
                 .as_ref()
-                .map(|image| image.process(tint, self.config.scale))
+                .map(|image| image.process(tint, self.config.tint_exact, self.config.scale))
         };
         if self.processed.is_none() {
             unsafe { ShowWindow(self.overlay, SW_HIDE) };
@@ -666,6 +709,7 @@ impl App {
         } else {
             unsafe { ShowWindow(self.overlay, SW_HIDE) };
         }
+        self.update_hide_now_button();
         self.save_config();
     }
 
@@ -907,10 +951,28 @@ impl App {
                 return;
             }
             append_menu(menu, MENU_SETTINGS, "Settings");
-            append_menu(menu, MENU_CENTER, "Center Crosshair");
+            append_menu(menu, MENU_CENTER, "Center + Reset Offsets");
             append_menu(menu, MENU_SHOW, "Show Crosshair");
             append_menu(menu, MENU_HIDE, "Hide Crosshair");
             append_menu(menu, MENU_LOAD, "Load Crosshair");
+            EnableMenuItem(
+                menu,
+                MENU_SHOW as u32,
+                if self.config.visible {
+                    MF_GRAYED
+                } else {
+                    MF_ENABLED
+                },
+            );
+            EnableMenuItem(
+                menu,
+                MENU_HIDE as u32,
+                if self.config.visible {
+                    MF_ENABLED
+                } else {
+                    MF_GRAYED
+                },
+            );
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
             append_menu(menu, MENU_EXIT, "Exit");
             let mut point = POINT::default();
@@ -994,11 +1056,11 @@ pub fn run() {
             0,
             settings_class.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             540,
-            684,
+            640,
             null_mut(),
             null_mut(),
             instance,
@@ -1135,6 +1197,14 @@ unsafe extern "system" fn settings_proc(
                         app.config.tint_enabled =
                             SendMessageW(app.controls.tint_enabled, BM_GETCHECK, 0, 0)
                                 == BST_CHECKED as isize;
+                        app.update_tint_controls();
+                        app.rebuild_processed();
+                        app.save_config();
+                    }
+                    (ID_TINT_EXACT, BN_CLICKED) => {
+                        app.config.tint_exact =
+                            SendMessageW(app.controls.tint_exact, BM_GETCHECK, 0, 0)
+                                == BST_CHECKED as isize;
                         app.rebuild_processed();
                         app.save_config();
                     }
@@ -1147,6 +1217,16 @@ unsafe extern "system" fn settings_proc(
                         }
                     }
                     (ID_TINT_PICK, BN_CLICKED) => app.choose_tint(),
+                    (ID_TINT_HEX, EN_KILLFOCUS) => {
+                        let value = get_text(app.controls.tint_hex);
+                        if parse_hex(&value).is_none() {
+                            app.initializing = true;
+                            set_text(app.controls.tint_hex, &app.config.tint);
+                            app.initializing = false;
+                        }
+                    }
+                    (ID_CLEAR, BN_CLICKED) => app.clear_image(),
+                    (ID_EXIT, BN_CLICKED) => app.exit(),
                     (ID_SCALE_INPUT, EN_CHANGE) if !app.initializing => {
                         if let Some(scale) =
                             parse_scale_percent(&get_text(app.controls.scale_input))
@@ -1219,13 +1299,12 @@ unsafe extern "system" fn settings_proc(
                                 _ => HideMode::Off,
                             };
                             app.apply_hide_bind();
-                            app.update_hide_hint();
                             app.update_hide_section();
                             app.save_config();
                         }
                     }
                     (ID_CENTER_NOW, BN_CLICKED) => app.reset_offsets_and_center(),
-                    (ID_HIDE_NOW, BN_CLICKED) => app.set_visible(false),
+                    (ID_HIDE_NOW, BN_CLICKED) => app.set_visible(!app.config.visible),
                     (id, _) if id == MENU_SETTINGS as i32 => app.show_settings(),
                     (id, _) if id == MENU_CENTER as i32 => app.reset_offsets_and_center(),
                     (id, _) if id == MENU_SHOW as i32 => app.set_visible(true),
@@ -1453,7 +1532,7 @@ unsafe extern "system" fn hotkey_edit_proc(
 unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
     unsafe {
         let font = GetStockObject(17) as HFONT;
-        create_label(app, hwnd, "Crosshair", 18, 14, 490, 22, font);
+        create_label(app, hwnd, "CROSSHAIR", 18, 14, 490, 22, font);
         create_label(app, hwnd, "Image:", 24, 49, 58, 22, font);
         app.controls.image_name = create_control(
             app,
@@ -1463,7 +1542,7 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             WS_CHILD | WS_VISIBLE,
             84,
             49,
-            315,
+            225,
             22,
             0,
             font,
@@ -1474,11 +1553,24 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             "BUTTON",
             "Load",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
+            318,
+            43,
+            88,
+            28,
+            ID_LOAD,
+            font,
+        );
+        create_control(
+            app,
+            hwnd,
+            "BUTTON",
+            "Clear",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
             410,
             43,
             92,
             28,
-            ID_LOAD,
+            ID_CLEAR,
             font,
         );
         app.controls.tint_enabled = create_control(
@@ -1507,7 +1599,7 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             ID_TINT_HEX,
             font,
         );
-        create_control(
+        app.controls.tint_pick = create_control(
             app,
             hwnd,
             "BUTTON",
@@ -1518,6 +1610,19 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             100,
             28,
             ID_TINT_PICK,
+            font,
+        );
+        app.controls.tint_exact = create_control(
+            app,
+            hwnd,
+            "BUTTON",
+            "Exact",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32,
+            334,
+            84,
+            100,
+            25,
+            ID_TINT_EXACT,
             font,
         );
         create_label(app, hwnd, "Scale:", 24, 125, 68, 22, font);
@@ -1551,7 +1656,7 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             app,
             hwnd,
             "STATIC",
-            "x  (100%)",
+            "x",
             WS_CHILD | WS_VISIBLE,
             428,
             125,
@@ -1608,7 +1713,7 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             font,
         );
 
-        create_label(app, hwnd, "Hide / Show", 18, 358, 490, 22, font);
+        create_label(app, hwnd, "VISIBILITY", 18, 358, 490, 22, font);
         create_label(app, hwnd, "Mode:", 24, 400, 52, 22, font);
         app.controls.hide_mode = create_control(
             app,
@@ -1668,21 +1773,7 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             ID_HOTKEY_SHOW,
             font,
         );
-        app.controls.hide_hint = create_control(
-            app,
-            hwnd,
-            "STATIC",
-            "Hide/show binds are disabled.",
-            WS_CHILD | WS_VISIBLE,
-            24,
-            472,
-            478,
-            34,
-            ID_HIDE_HINT,
-            font,
-        );
-
-        create_label(app, hwnd, "Hotkeys", 18, 522, 490, 22, font);
+        create_label(app, hwnd, "CENTER HOTKEY", 18, 474, 490, 22, font);
         (_, app.controls.hotkey_center) = hotkey_control(
             app,
             hwnd,
@@ -1691,7 +1782,7 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             70,
             96,
             228,
-            557,
+            509,
             ID_HOTKEY_CENTER,
             font,
         );
@@ -1700,26 +1791,39 @@ unsafe fn create_settings_controls(app: &mut App, hwnd: HWND) {
             app,
             hwnd,
             "BUTTON",
-            "Center Now",
+            "Center + Reset",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
             24,
-            600,
-            126,
+            552,
+            140,
             30,
             ID_CENTER_NOW,
+            font,
+        );
+        app.controls.hide_now = create_control(
+            app,
+            hwnd,
+            "BUTTON",
+            "Hide Crosshair",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
+            172,
+            552,
+            132,
+            30,
+            ID_HIDE_NOW,
             font,
         );
         create_control(
             app,
             hwnd,
             "BUTTON",
-            "Hide Crosshair",
+            "Exit",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
-            164,
-            600,
-            132,
+            410,
+            552,
+            92,
             30,
-            ID_HIDE_NOW,
+            ID_EXIT,
             font,
         );
     }
@@ -1957,7 +2061,7 @@ fn centered_position(
     )
 }
 
-fn hide_section_visibility(mode: HideMode) -> (bool, bool) {
+fn hide_section_enabled(mode: HideMode) -> (bool, bool) {
     match mode {
         HideMode::Off => (false, false),
         HideMode::Toggle => (false, true),
@@ -2180,7 +2284,7 @@ fn make_lparam(low: u16, high: u16) -> isize {
 #[cfg(test)]
 mod tests {
     use super::{
-        Monitor, centered_position, hide_section_visibility, parse_offset_px, parse_percent_value,
+        Monitor, centered_position, hide_section_enabled, parse_offset_px, parse_percent_value,
         parse_scale_percent,
     };
     use crate::config::HideMode;
@@ -2241,8 +2345,8 @@ mod tests {
 
     #[test]
     fn shows_only_binds_used_by_the_selected_hide_mode() {
-        assert_eq!(hide_section_visibility(HideMode::Off), (false, false));
-        assert_eq!(hide_section_visibility(HideMode::Toggle), (false, true));
-        assert_eq!(hide_section_visibility(HideMode::Hold), (true, false));
+        assert_eq!(hide_section_enabled(HideMode::Off), (false, false));
+        assert_eq!(hide_section_enabled(HideMode::Toggle), (false, true));
+        assert_eq!(hide_section_enabled(HideMode::Hold), (true, false));
     }
 }
